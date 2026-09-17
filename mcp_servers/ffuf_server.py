@@ -132,7 +132,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if exts:
         if not re.fullmatch(r"[A-Za-z0-9,]+", exts):
             return [TextContent(type="text", text="error: invalid extensions")]
-        cmd += ["-e", "." + ext if "," not in exts else ",".join("." + e for e in exts.split(","))]
+        cmd += ["-e", ",".join("." + e for e in exts.split(","))]
 
     try:
         code, out, err = (lambda r: (r.returncode, r.stdout, r.stderr))(

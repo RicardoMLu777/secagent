@@ -1,10 +1,13 @@
 # SecAgent 🔐
 
 > 基于 **MCP (Model Context Protocol)** 的自主安全评估 Agent —— 把真实的 Kali 安全工具封装成 MCP Server，让 LLM **显式规划**、并/串行调用工具、分层记忆发现、映射 MITRE ATT&CK、自动生成报告。
+>
+> **安全优先**：侵入式操作默认需要人工批准，工具调用全程审计，支持目标白名单与私网访问管控。
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.9.4-green.svg)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-54%20passed-brightgreen.svg)](tests/)
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue.svg)](.github/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -103,9 +106,14 @@ report written: out/report.md
 │                          │  distilled findings       │   │
 │                          └───────────────────────────┘   │
 │                                        │                 │
-│                          ┌─────────────┴─────────────┐   │
-│                          │   ATT&CK Mapper + Report  │   │
-│                          └───────────────────────────┘   │
+│            ┌─────────────┴─────────────┐                 │
+│            │  Policy Gate              │                 │
+│            │  deny / ask / allow       │                 │
+│            └─────────────┬─────────────┘                 │
+│            ┌─────────────┴─────────────┐                 │
+│            │  ATT&CK Mapper + Report   │                 │
+│            │  + SQLite History         │                 │
+│            └───────────────────────────┘                 │
 └──────────────────────────┬───────────────────────────────┘
                            │ MCP protocol (stdio)
      ┌────────────┬────────┴───────┬────────────┐
@@ -127,7 +135,94 @@ report written: out/report.md
 | **MCP Manager** | `agent/mcp_client.py` | MCP Server 生命周期、工具发现、命名空间隔离 |
 | **Memory** | `agent/memory.py` | 双层记忆：原始观察（有预算）+ 结构化发现 |
 | **ATT&CK Mapper** | `agent/attack_map.py` | 发现 → MITRE ATT&CK 技术 ID + 配置弱点说明 |
+| **Policy** | `agent/policy.py` | 工具分级、目标白名单、人工批准门控 |
+| **Store** | `agent/store.py` | SQLite 持久化 + 历次扫描对比 |
+| **Retry** | `agent/retry.py` | 瞬时错误指数退避重试 |
 | **Report** | `agent/report.py` | 渲染 Markdown / JSON 报告 |
+
+---
+
+## 安全模型
+
+自主 Agent 执行真实的攻击工具，最大的风险是它自己决定去做什么。SecAgent 用三层约束解决这个问题。
+
+### 1. 工具分级 — 侵入式操作默认需要人工批准
+
+```python
+PASSIVE_TOOLS   = {"http_probe", "check_security_headers", "check_robots"}
+INTRUSIVE_TOOLS = {"nmap_scan", "nmap_vuln_scan", "sqlmap_scan",
+                   "sqlmap_dump", "ffuf_dirs", ...}
+```
+
+```bash
+$ python secagent.py --target 192.168.1.10 --policy ask
+
+step 2 · reasoning
+  → sqlmap_server__sqlmap_scan {"url": "http://192.168.1.10/news.php?id=1"}
+
+╭──────────────────── ⚠ approval required ────────────────────╮
+│ sqlmap_scan                                                 │
+│ {"url": "http://192.168.1.10/news.php?id=1"}                │
+│                                                             │
+│ 'sqlmap_scan' sends intrusive traffic and needs approval    │
+╰─────────────────────────────────────────────────────────────╯
+  Allow this action? [y/N]
+```
+
+三种模式：
+
+| 模式 | 被动工具 | 侵入工具 | 适用场景 |
+|------|---------|---------|---------|
+| `passive` | ✅ 自动放行 | ❌ 一律拒绝 | 生产环境的只读侦察 |
+| `ask`（默认） | ✅ 自动放行 | ⚠️ 弹窗等人工确认 | 常规渗透测试 |
+| `allow` | ✅ | ✅ | 明确授权的靶场 / 红队演练 |
+
+**未配置批准人时默认拒绝**（fail closed）——这是刻意的，避免"配置漏了"变成"全放行"。
+
+被拒绝的调用会以结构化 JSON 反馈给模型，并附上指引：
+
+```json
+{
+  "blocked": true,
+  "tool": "sqlmap_server__sqlmap_scan",
+  "reason": "'sqlmap_scan' sends intrusive traffic and needs approval",
+  "guidance": "This action was blocked by the engagement policy. Do not retry it."
+}
+```
+
+模型拿到这个不会死循环重试，而是转向被动手段或在报告里说明需要授权。
+
+### 2. 目标管控 — 白名单 + 私网保护
+
+```bash
+# 只允许指定域名，越界一律拒绝
+python secagent.py --target x --scope 'example\.com' --scope 'testsite\.org'
+
+# 禁止访问回环/内网地址（防 SSRF 式的误操作）
+python secagent.py --target x --deny-private
+
+# 彻底禁用某个工具
+python secagent.py --target x --deny-tools sqlmap_dump ffuf_dirs
+```
+
+`--deny-private` 拦截 `127.`、`10.`、`172.16-31.`、`192.168.`、`169.254.`——这条规则在扫内网时要注意关掉。
+
+### 3. 全链路审计
+
+每次工具调用都记录决策与理由：
+
+```bash
+$ python secagent.py --target x --policy ask --json | jq '.tool_audit'
+[
+  {"step": 1, "tool": "httpx_server__http_probe",
+   "decision": "allow", "reason": "passive reconnaissance"},
+  {"step": 2, "tool": "sqlmap_server__sqlmap_scan",
+   "decision": "ask-denied",
+   "reason": "'sqlmap_scan' sends intrusive traffic and needs approval..."}
+]
+```
+
+审计日志同时落库，可以回溯"这次评估到底跑过什么、谁批的"。
 
 ---
 
@@ -299,6 +394,74 @@ httpx_server__http_probe
 
 ---
 
+## 历史与对比
+
+每次评估自动落库（SQLite，默认 `~/.secagent/engagements.db`），可以回溯和对比同一个目标的历次扫描。
+
+```bash
+# 查看历史
+$ python secagent.py history --target example.com
+
+         Engagement history
+┏━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
+┃ ID ┃ Target     ┃ Started             ┃ Steps ┃ Calls ┃ Flags              ┃
+┡━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━━━━━━━━━━━━━┩
+│ 7  │ example.com│ 2026-09-17T14:20:11 │ 6     │ 14    │ flag{new_finding}  │
+│ 3  │ example.com│ 2026-09-10T09:02:44 │ 5     │ 11    │ -                  │
+└────┴────────────┴─────────────────────┴───────┴───────┴────────────────────┘
+
+# 对比两次扫描
+$ python secagent.py diff 3 7
+
+example.com  #3 (2026-09-10T09:02:44) → #7 (2026-09-17T14:20:11)
+  + ports: 8080
+  - headers: x-frame-options
+  + flags: flag{new_finding}
+  = services: no change (4)
+
+# 所有评估过的目标
+$ python secagent.py targets
+```
+
+对比维度：开放端口、服务版本、缺失的安全头、敏感路径、Flag。
+
+关掉持久化用 `--no-store`，或指定库路径 `--db /path/to.db`。
+
+---
+
+## 容错
+
+工具调用遇到网络抖动、超时、5xx 时自动重试（指数退避 + 抖动），最多 3 次：
+
+```python
+TRANSIENT_MARKERS = (
+    "timeout", "connection refused", "connection reset",
+    "502 bad gateway", "503 service unavailable", "rate limit", ...
+)
+```
+
+只有**瞬时错误**才重试——遇到"目标不可达"这类确定性失败直接返回，不做无谓等待。重试过程会打印 `↻ retry 1` 让使用者看到。
+
+调整次数：`retry_attempts=5`（构造参数）。
+
+---
+
+## CI
+
+推送到 `main` 自动触发 GitHub Actions：
+
+```yaml
+matrix: python 3.11 / 3.12 / 3.13
+  - pytest tests/          # 54 个测试
+lint:
+  - ruff check .           # E/F/W 规则
+  - compileall             # 字节码编译检查
+```
+
+CI 曾经抓到过一个真 bug：`ffuf_server.py` 里 `ext` 变量名写错（应为 `exts`），静态检查直接暴露。这就是把 lint 放进 CI 的价值。
+
+---
+
 ## 扩展新的 MCP Server
 
 在 `mcp_servers/` 下按模板新建即可，运行时钟自动发现：
@@ -343,65 +506,3 @@ secagent/
 │   ├── __init__.py
 │   ├── core.py           # ReAct 主循环 + 并行执行
 │   ├── planner.py        # Plan-and-Execute 规划层
-│   ├── mcp_client.py     # MCP Server 生命周期 + 工具发现
-│   ├── memory.py         # 双层记忆
-│   ├── attack_map.py     # MITRE ATT&CK 映射
-│   └── report.py         # Markdown / JSON 报告
-├── mcp_servers/
-│   ├── nmap_server.py    # 2 tools
-│   ├── httpx_server.py   # 3 tools
-│   ├── sqlmap_server.py  # 3 tools
-│   └── ffuf_server.py    # 1 tool
-├── tests/                # 20 个单元测试
-├── secagent.py           # CLI 入口
-├── requirements.txt
-├── .env.example
-└── LICENSE
-```
-
----
-
-## 测试
-
-```bash
-pytest tests/ -v
-# 20 passed
-```
-
-覆盖：记忆蒸馏、ATT&CK 映射、报告渲染、规划器 JSON 解析、计划状态机。
-
----
-
-## 已知限制
-
-- **无跨会话持久记忆**：每次运行是一次性任务，不累积历史
-- **规划质量依赖模型**：小模型可能产出模糊的计划
-- **无主动确认机制**：标记为 `[intrusive]` 的任务不会真的停下来等人工确认（目前只在 prompt 里提示）
-- **单目标**：一次运行针对一个目标，无多目标编排
-
-这些都是有意的 MVP 取舍。
-
----
-
-## Roadmap
-
-- [ ] 向量库长期记忆（跨会话积累目标画像）
-- [ ] `[intrusive]` 任务的人工确认门控
-- [ ] 更多 MCP Server（nuclei / nikto / gobuster）
-- [ ] Web UI（可视化计划执行过程）
-- [ ] 多目标批量编排
-- [ ] 报告导出 PDF
-
----
-
-## 法律声明
-
-**本项目仅供授权的安全测试、研究和教育用途。**
-
-使用前必须获得目标系统的**明确书面授权**。未经授权对他人系统进行扫描或攻击是违法的。使用者需自行承担全部法律责任。
-
----
-
-## License
-
-MIT
