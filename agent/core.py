@@ -1,9 +1,9 @@
 """ReAct agent loop — reason, act via MCP tools, observe, repeat.
 
-v0.2 adds:
-  - explicit Planner (Plan-and-Execute) alongside the reactive loop
-  - parallel tool execution when the model requests multiple calls
-  - MITRE ATT&CK mapping in the final report
+v0.3 adds:
+  - engagement policy that gates intrusive tools behind approval
+  - SQLite persistence of engagements and tool calls
+  - retry with exponential backoff on transient tool failures
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 from typing import Any
 
 from openai import OpenAI
@@ -22,6 +21,9 @@ from .attack_map import map_findings
 from .memory import Memory
 from .mcp_client import MCPManager
 from .planner import Planner, Plan
+from .policy import Decision, EngagementPolicy, render_denial
+from .retry import with_retry
+from .store import Store
 
 console = Console()
 
@@ -72,6 +74,9 @@ class SecAgent:
         verbose: bool = True,
         use_planner: bool = True,
         parallel: bool = True,
+        policy: EngagementPolicy | None = None,
+        store: Store | None = None,
+        retry_attempts: int = 3,
     ) -> None:
         self.servers = servers
         self.model = model or os.getenv("SECAGENT_MODEL", "deepseek-chat")
@@ -85,6 +90,10 @@ class SecAgent:
         self.verbose = verbose
         self.use_planner = use_planner
         self.parallel = parallel
+        self.policy = policy or EngagementPolicy(mode="ask")
+        self.store = store
+        self.retry_attempts = retry_attempts
+        self.audit_log: list[dict[str, Any]] = []
 
         if not self.api_key:
             raise RuntimeError(
@@ -97,9 +106,51 @@ class SecAgent:
         if self.verbose:
             console.print(msg, style=style)
 
+    async def _guarded_call(
+        self, mcp: MCPManager, tool: str, args: dict[str, Any], step: int
+    ) -> tuple[str, bool]:
+        """Evaluate policy, then call the tool with retry. Returns (result, blocked)."""
+        decision, reason = self.policy.evaluate(tool, args)
+
+        if decision is Decision.DENY:
+            self._log(f"     [red]✕ blocked[/red] {reason}")
+            self.audit_log.append(
+                {"step": step, "tool": tool, "arguments": args,
+                 "decision": "deny", "reason": reason}
+            )
+            return render_denial(tool, reason), True
+
+        if decision is Decision.ASK:
+            approved = self.policy.request_approval(tool, args, reason)
+            self.audit_log.append(
+                {"step": step, "tool": tool, "arguments": args,
+                 "decision": "allow" if approved else "ask-denied", "reason": reason}
+            )
+            if not approved:
+                self._log(f"     [yellow]⊘ awaiting approval[/yellow] {reason}")
+                return render_denial(
+                    tool, f"{reason} — no human approval was granted"
+                ), True
+            self._log(f"     [green]✓ approved[/green] {reason}")
+
+        self.audit_log.append(
+            {"step": step, "tool": tool, "arguments": args,
+             "decision": "allow", "reason": reason}
+        )
+
+        def _on_retry(attempt: int, preview: str) -> None:
+            self._log(f"     [yellow]↻ retry {attempt}[/yellow] {preview}")
+
+        result = await with_retry(
+            lambda: mcp.call(tool, args),
+            max_attempts=self.retry_attempts,
+            on_retry=_on_retry,
+        )
+        return result, False
+
     async def _execute_calls(
-        self, mcp: MCPManager, tool_calls: list[Any]
-    ) -> list[tuple[Any, dict[str, Any], str]]:
+        self, mcp: MCPManager, tool_calls: list[Any], step: int
+    ) -> list[tuple[Any, dict[str, Any], str, bool]]:
         """Run tool calls — in parallel when enabled, else sequentially."""
         parsed: list[tuple[Any, dict[str, Any]]] = []
         for tc in tool_calls:
@@ -111,28 +162,52 @@ class SecAgent:
 
         if self.parallel and len(parsed) > 1:
             self._log(f"  [dim]running {len(parsed)} tool calls in parallel[/dim]")
-            results = await asyncio.gather(
-                *(mcp.call(tc.function.name, args) for tc, args in parsed),
+            gathered = await asyncio.gather(
+                *(
+                    self._guarded_call(mcp, tc.function.name, args, step)
+                    for tc, args in parsed
+                ),
                 return_exceptions=True,
             )
-            out: list[tuple[Any, dict[str, Any], str]] = []
-            for (tc, args), res in zip(parsed, results):
-                text = (
-                    f"error: {type(res).__name__}: {res}"
-                    if isinstance(res, BaseException)
-                    else str(res)
-                )
-                out.append((tc, args, text))
+            out: list[tuple[Any, dict[str, Any], str, bool]] = []
+            for (tc, args), res in zip(parsed, gathered):
+                if isinstance(res, BaseException):
+                    out.append(
+                        (tc, args, f"error: {type(res).__name__}: {res}", False)
+                    )
+                else:
+                    text, blocked = res
+                    out.append((tc, args, text, blocked))
             return out
 
         out = []
         for tc, args in parsed:
-            out.append((tc, args, await mcp.call(tc.function.name, args)))
+            text, blocked = await self._guarded_call(
+                mcp, tc.function.name, args, step
+            )
+            out.append((tc, args, text, blocked))
         return out
 
     async def run(self, objective: str, plan: Plan | None = None) -> dict[str, Any]:
         memory = Memory()
         steps_used = 0
+        engagement_id: int | None = None
+
+        if self.store:
+            target = ""
+            for token in objective.split():
+                if "." in token or "://" in token:
+                    target = token.strip(".,;()")
+                    break
+            engagement_id = self.store.start_engagement(
+                target=target or "unknown",
+                objective=objective,
+                policy={
+                    "mode": self.policy.mode,
+                    "scope": self.policy.scope,
+                    "denied": sorted(self.policy.denied_tools),
+                },
+            )
 
         async with MCPManager(self.servers) as mcp:
             tools = mcp.openai_tools()
@@ -214,7 +289,7 @@ class SecAgent:
                             for o in memory.observations
                         ],
                     )
-                    return {
+                    result = {
                         "objective": objective,
                         "steps": steps_used,
                         "report": report,
@@ -230,7 +305,12 @@ class SecAgent:
                             else []
                         ),
                         "observations": len(memory.observations),
+                        "tool_audit": self.audit_log,
                     }
+                    if self.store and engagement_id:
+                        self.store.finish_engagement(engagement_id, result)
+                        result["engagement_id"] = engagement_id
+                    return result
 
                 messages.append(
                     {
@@ -251,15 +331,22 @@ class SecAgent:
                 )
 
                 # Execute (possibly in parallel), then record + feed back.
-                for tc, args, result in await self._execute_calls(mcp, msg.tool_calls):
+                for tc, args, result, blocked in await self._execute_calls(
+                    mcp, msg.tool_calls, step
+                ):
                     self._log(
                         f"  → [bold]{tc.function.name}[/bold] "
                         f"{json.dumps(args, ensure_ascii=False)}"
                     )
                     short = result.replace("\n", " ")[:160]
-                    self._log(f"     [green]✓[/green] {short}", style="dim")
+                    marker = "[red]✕[/red]" if blocked else "[green]✓[/green]"
+                    self._log(f"     {marker} {short}", style="dim")
 
                     memory.record(step, tc.function.name, args, result)
+                    if self.store and engagement_id:
+                        self.store.record_tool_call(
+                            engagement_id, step, tc.function.name, args, result, blocked
+                        )
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.id, "content": result}
                     )
@@ -297,7 +384,7 @@ class SecAgent:
             {k: sorted(v) for k, v in memory.findings.items()},
             [{"tool": o.tool, "result": o.result} for o in memory.observations],
         )
-        return {
+        result = {
             "objective": objective,
             "steps": steps_used,
             "report": "(max steps reached without a final report)",
@@ -309,4 +396,9 @@ class SecAgent:
                 else []
             ),
             "observations": len(memory.observations),
+            "tool_audit": self.audit_log,
         }
+        if self.store and engagement_id:
+            self.store.finish_engagement(engagement_id, result)
+            result["engagement_id"] = engagement_id
+        return result
