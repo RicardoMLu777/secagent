@@ -130,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope",
         nargs="+",
         default=[],
-        help="Regex allowlist of in-scope targets; anything else is denied",
+        help="Regex allowlist matched against the target hostname; anything else is denied",
     )
     p.add_argument(
         "--deny-tools",

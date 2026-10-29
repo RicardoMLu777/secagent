@@ -11,7 +11,9 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from ipaddress import ip_address, ip_network
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 
 class Decision(str, Enum):
@@ -37,6 +39,39 @@ PASSIVE_TOOLS: set[str] = {
     "check_security_headers",
     "check_robots",
 }
+
+
+# Loopback and RFC1918 ranges rejected by --deny-private.
+PRIVATE_NETWORKS: tuple = (
+    ip_network("127.0.0.0/8"),
+    ip_network("10.0.0.0/8"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.168.0.0/16"),
+    ip_network("169.254.0.0/16"),
+    ip_network("::1/128"),
+)
+
+
+def _extract_host(target: str) -> str:
+    """Pull the hostname out of a URL or a bare ``host[:port]`` target.
+
+    Scope checks must run against the hostname, not the raw string: matching a
+    pattern anywhere inside a full URL lets ``http://example.com.attacker.net``
+    satisfy a scope entry of ``example.com``, because the authorised name also
+    appears as a prefix of the attacker-controlled host.
+
+    Returns an empty string when the target cannot be parsed, which callers
+    treat as "not in scope" rather than "in scope".
+    """
+    t = target.strip()
+    if not t:
+        return ""
+    if "://" not in t:
+        t = "//" + t
+    try:
+        return (urlsplit(t).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 @dataclass
@@ -71,29 +106,55 @@ class EngagementPolicy:
         return bare in INTRUSIVE_TOOLS
 
     def _target_in_scope(self, arguments: dict[str, Any]) -> tuple[bool, str]:
-        """If a scope list is configured, every target must match it."""
+        """If a scope list is configured, the target hostname must match one entry fully.
+
+        Patterns are matched against the hostname alone (never the full URL) and
+        must match the whole host, so ``example.com`` does not authorise
+        ``example.com.attacker.net`` or ``evilexample.com``. Use
+        ``.*\\.example\\.com`` to permit subdomains.
+        """
         if not self.scope:
             return True, ""
-        target = str(
-            arguments.get("url") or arguments.get("target") or ""
-        ).strip()
-        if not target:
+
+        raw = str(arguments.get("url") or arguments.get("target") or "").strip()
+        if not raw:
             return True, ""
+
+        host = _extract_host(raw)
+        if not host:
+            return False, f"target '{raw}' could not be parsed as a hostname"
+
         for pattern in self.scope:
-            if re.search(pattern, target, re.I):
+            if re.fullmatch(pattern, host, re.I):
                 return True, ""
-        return False, f"target '{target}' is outside the declared scope"
+        return False, f"target '{host}' is outside the declared scope"
 
     def _hits_denied_network(self, arguments: dict[str, Any]) -> tuple[bool, str]:
+        """Reject loopback and RFC1918 literals when private targets are banned.
+
+        Only IP literals are range-checked, so a hostname that merely starts with
+        ``10.`` (e.g. ``10.example.com``) is not misclassified. This is still a
+        string-level check: it does not resolve DNS, so a public hostname that
+        resolves to a private address is not caught here.
+        """
         if not self.deny_private_targets:
             return False, ""
-        target = str(arguments.get("url") or arguments.get("target") or "")
-        if re.search(
-            r"(127\.|localhost|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.)",
-            target,
-            re.I,
-        ):
-            return True, f"target '{target}' is a private/loopback address"
+
+        raw = str(arguments.get("url") or arguments.get("target") or "")
+        host = _extract_host(raw) or raw.strip().lower()
+        if not host:
+            return False, ""
+
+        if host == "localhost":
+            return True, f"target '{host}' is a loopback address"
+
+        try:
+            ip = ip_address(host)
+        except ValueError:
+            return False, ""  # a hostname, not an IP literal
+
+        if any(ip in net for net in PRIVATE_NETWORKS):
+            return True, f"target '{host}' is a private/loopback address"
         return False, ""
 
     def evaluate(self, tool: str, arguments: dict[str, Any]) -> tuple[Decision, str]:
