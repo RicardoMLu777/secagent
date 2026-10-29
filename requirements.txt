@@ -2,6 +2,11 @@
 # green build because openai had moved from 1.x to 3.x. Constrain the majors
 # until the client code is verified against the newer APIs.
 mcp==1.9.4
+# mcp 1.9.4 imports pydantic._internal._typing_extra.eval_type_backport, a
+# private helper that newer pydantic releases no longer export. Its own range
+# is pydantic>=2.7.2,<3, so a fresh install resolves to 2.14.x and every test
+# module dies with ImportError. Applies to 2.12 and later.
+pydantic>=2.7.2,<2.12
 openai>=1.40,<2
 httpx>=0.27,<0.29
 python-dotenv>=1.0,<2
