@@ -38,12 +38,14 @@ jobs:
       - name: Collect failure details
         if: failure()
         run: |
-          pytest tests/ -q --tb=short > /tmp/pytest.log 2>&1 || true
-          grep -E "^(FAILED|ERROR)" /tmp/pytest.log | head -8 | while IFS= read -r line; do
-            echo "::error::$line"
-          done
-          echo "--- tail ---"
-          tail -40 /tmp/pytest.log
+          echo "===== installed versions ====="
+          pip list 2>/dev/null | grep -iE "^(openai|mcp|pydantic|httpx|rich|pytest)" || true
+          echo "===== import agent ====="
+          python -c "import agent" > /tmp/imp.log 2>&1 || true
+          cat /tmp/imp.log
+          tail -6 /tmp/imp.log | while IFS= read -r line; do echo "::error::IMP $line"; done
+          echo "===== pytest head ====="
+          pytest tests/ -q 2>&1 | head -25 || true
 
   lint:
     runs-on: ubuntu-latest
