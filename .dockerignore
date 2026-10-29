@@ -1,0 +1,16 @@
+.git
+.gitignore
+.github
+venv
+.venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+.env
+.pytest_cache
+.ruff_cache
+out
+*.md
+!README.md
+.DS_Store
