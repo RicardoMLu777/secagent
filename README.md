@@ -6,9 +6,11 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-1.9.4-green.svg)](https://modelcontextprotocol.io/)
-[![Tests](https://img.shields.io/badge/tests-54%20passed-brightgreen.svg)](tests/)
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-blue.svg)](.github/workflows/tests.yml)
+[![tests](https://github.com/RicardoMLu777/secagent/actions/workflows/tests.yml/badge.svg)](https://github.com/RicardoMLu777/secagent/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> [!WARNING]
+> **仅限授权测试。** SecAgent 会执行真实的端口扫描、目录爆破与 SQL 注入检测。请只在自有资产、持有书面授权的目标或本地靶场中使用。未授权扫描在多数司法辖区属于违法行为。详见文末 [Disclaimer](#disclaimer)。
 
 ---
 
@@ -17,8 +19,10 @@
 给一个目标，Agent 自己规划、自己决定每一步做什么：
 
 ```bash
-$ python secagent.py --target 192.168.1.10 --report out/report.md
+$ python secagent.py --target 192.168.1.10 --report out/report.md --policy allow
 ```
+
+> 这里用 `--policy allow` 是因为演示环境是明确授权的本地靶场。默认模式是 `ask`，会对每一步侵入式操作弹出人工确认——见下方[安全模型](#安全模型)。
 
 ```
 ╭────────────────────────────── plan ──────────────────────────────╮
@@ -205,7 +209,9 @@ python secagent.py --target x --deny-private
 python secagent.py --target x --deny-tools sqlmap_dump ffuf_dirs
 ```
 
-`--deny-private` 拦截 `127.`、`10.`、`172.16-31.`、`192.168.`、`169.254.`——这条规则在扫内网时要注意关掉。
+`--scope` 按 **hostname 全匹配**，不是子串匹配：`example\.com` 不会放行 `example.com.attacker.net` 或 `evilexample.com`。要放行子域需显式写出 `--scope '.*\.example\.com'`。
+
+`--deny-private` 拦截 `127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`169.254.0.0/16` 与 `::1`。判断依据是 IP 字面量，因此 `10.example.com` 这类域名不会被误伤。这条规则在扫内网时要注意关掉。
 
 ### 3. 全链路审计
 
@@ -241,12 +247,29 @@ sudo apt install nmap sqlmap ffuf
 ### 安装
 
 ```bash
-git clone https://github.com/<your-username>/secagent.git
+git clone https://github.com/RicardoMLu777/secagent.git
 cd secagent
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### 用 Docker 跑（不想装工具链时用这个）
+
+镜像里已经带好 nmap / sqlmap / ffuf，宿主机不需要任何安全工具：
+
+```bash
+docker build -t secagent .
+
+# Linux：--network host 让扫描能到达你的靶场网段
+docker run --rm --network host --env-file .env secagent --target 192.168.1.10
+
+# 想留一份报告出来
+docker run --rm --network host --env-file .env -v "$PWD/out:/app/out" \
+  secagent --target 192.168.1.10 --report out/report.md
+```
+
+镜像内以非 root 用户运行。`--deny-private` 默认**关闭**，扫内网靶场不用额外处理。
 
 ### 配置
 
@@ -452,7 +475,7 @@ TRANSIENT_MARKERS = (
 
 ```yaml
 matrix: python 3.11 / 3.12 / 3.13
-  - pytest tests/          # 54 个测试
+  - pytest tests/          # 单元测试
 lint:
   - ruff check .           # E/F/W 规则
   - compileall             # 字节码编译检查
@@ -464,7 +487,7 @@ CI 曾经抓到过一个真 bug：`ffuf_server.py` 里 `ext` 变量名写错（�
 
 ## 扩展新的 MCP Server
 
-在 `mcp_servers/` 下按模板新建即可，运行时钟自动发现：
+在 `mcp_servers/` 下按模板新建即可，运行时会自动发现：
 
 ```python
 from mcp.server import Server
@@ -506,3 +529,85 @@ secagent/
 │   ├── __init__.py
 │   ├── core.py           # ReAct 主循环 + 并行执行
 │   ├── planner.py        # Plan-and-Execute 规划层
+│   ├── mcp_client.py     # MCP Server 生命周期与工具发现
+│   ├── memory.py         # 双层记忆：原始观察 + 结构化发现
+│   ├── attack_map.py     # 发现 → MITRE ATT&CK 映射
+│   ├── policy.py         # 工具分级、白名单、审批门控
+│   ├── store.py          # SQLite 持久化与历次对比
+│   ├── retry.py          # 瞬时错误指数退避
+│   └── report.py         # Markdown / JSON 报告渲染
+├── mcp_servers/
+│   ├── nmap_server.py    # 端口扫描 / NSE
+│   ├── httpx_server.py   # HTTP 探测 / 安全头 / robots
+│   ├── sqlmap_server.py  # 注入检测 / 库表枚举 / 导出
+│   └── ffuf_server.py    # 目录爆破
+├── tests/                # 单元测试
+├── .github/workflows/tests.yml
+├── secagent.py           # CLI 入口
+├── requirements.txt
+├── .env.example
+├── Dockerfile
+├── LICENSE
+└── README.md
+```
+
+---
+
+## 安全修复记录
+
+记录本项目自己被审计出来的问题及修复方式。
+
+### `--scope` 白名单可被绕过（已修复）
+
+早期实现用 `re.search(pattern, target)` 对整个目标字符串做子串匹配，`--scope 'example\.com'` 会放行以下目标：
+
+| 目标 | 为什么能绕过 |
+|---|---|
+| `http://example.com.attacker.net` | 授权域名作为攻击者域名的前缀出现 |
+| `http://evilexample.com` | 授权域名作为子串出现 |
+| `http://example.com@attacker.net` | `@` 前是 userinfo，真实 host 是 `attacker.net` |
+| `https://attacker.net/?next=example.com` | 子串出现在 query 里 |
+
+现在改为先 `urlsplit` 提取 hostname，再 `re.fullmatch` 全匹配，回归测试见 `tests/test_policy_scope.py`。
+
+同一次审计还发现 `--deny-private` 用字符串正则判断，会把 `10.example.com`、`notlocalhost.com` 误判为私网地址；已改用 `ipaddress` 判断 IP 字面量。
+
+> 教训：**校验点选错位置，比不做校验更危险**——它给你的是虚假的安全感。
+
+---
+
+## 已知局限
+
+诚实记录边界，不做过度承诺。
+
+1. **不解析 DNS** —— `--deny-private` 只判断 IP 字面量。若某个域名解析到 `192.168.x.x`（DNS rebinding 一类手法），字符串层拦不住。正确做法是在建立连接前对解析结果再校验一次，当前未实现。
+2. **工具输出解析依赖正则** —— `memory.py` 从原始输出中抽取端口、服务、路径等事实。工具版本升级改变输出格式时抽取可能失败，降级策略是保留原始观察、放弃结构化字段，不中断执行。
+3. **未对抗 prompt injection** —— 如果被扫描目标返回的 banner 或页面内容里嵌入了指令，模型的规划可能被污染。目前依赖 policy 层兜底（越界目标会被拒绝），但没有输入侧的隔离与净化。
+4. **单机单进程** —— 没有任务队列、没有并发目标隔离。定位是单次授权评估的辅助工具，不是扫描平台。
+5. **规划质量受模型能力影响** —— 换用小模型时计划可能过于保守或重复。`--no-planner` 可以退回纯 ReAct 做对比实验。
+
+---
+
+## 后续计划
+
+- [ ] 解析后 IP 校验，堵住 DNS rebinding 路径
+- [ ] 目标响应内容与指令上下文隔离，做 prompt injection 防护
+- [ ] 新增 `nuclei_server.py`（模板化漏洞检测）
+- [ ] 报告支持 SARIF 输出，便于接入 CI
+- [ ] 附一份本地靶场（DVWA / OWASP Juice Shop）的端到端复现指南
+
+---
+
+## Disclaimer
+
+本项目仅用于**获得明确授权的安全测试**、教学与安全研究。
+
+使用者须确保：
+
+- 对目标拥有所有权，或持有书面的渗透测试授权；
+- 遵守所在地法律法规——在中国境内，未经授权对计算机信息系统进行扫描、探测或获取数据，可能违反《中华人民共和国网络安全法》及《刑法》第二百八十五条；
+- 不将本工具用于任何未授权目标。
+
+工具内置的审批门控、目标白名单与私网管控是**降低误操作风险的设计**，不构成使用授权的替代。作者不对任何滥用行为及由此产生的后果承担责任。
+
+在本地靶场练习，永远是正确的第一步。
