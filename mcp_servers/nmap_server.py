@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import shutil
 import subprocess
 from typing import Any
@@ -10,6 +9,8 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
+
+from mcp_guard import validate_ports, validate_target
 
 app = Server("nmap-server")
 
@@ -84,11 +85,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if not target:
         return [TextContent(type="text", text="error: 'target' is required")]
 
-    # Basic input hardening: reject shell metacharacters outright.
-    if re.search(r"[;&|`$><\n]", target):
-        return [TextContent(type="text", text="error: invalid characters in target")]
+    # Arguments reach nmap as argv, not through a shell, so shell metacharacters
+    # are not the risk here - a leading "-" is. Validate the shape instead of
+    # blacklisting, otherwise "-iL /etc/passwd" is accepted and nmap opens a file.
+    problem = validate_target(target)
+    if problem:
+        return [TextContent(type="text", text=f"error: {problem}")]
 
     ports = arguments.get("ports", "").strip()
+    problem = validate_ports(ports)
+    if problem:
+        return [TextContent(type="text", text=f"error: {problem}")]
 
     if name == "nmap_scan":
         cmd = ["nmap", "-Pn", "-T4", "--open"]
