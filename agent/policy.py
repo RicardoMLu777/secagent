@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from ipaddress import ip_address, ip_network
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -50,6 +52,30 @@ PRIVATE_NETWORKS: tuple = (
     ip_network("169.254.0.0/16"),
     ip_network("::1/128"),
 )
+
+
+def _as_ip(host: str):
+    """Return an ip_address object, or None when the string is not an IP literal."""
+    try:
+        return ip_address(host)
+    except ValueError:
+        return None
+
+
+def _is_private_addr(ip) -> bool:
+    return any(ip in net for net in PRIVATE_NETWORKS)
+
+
+@lru_cache(maxsize=256)
+def _default_resolve(host: str) -> tuple[str, ...]:
+    """Resolve a hostname to its addresses.
+
+    Cached for the life of the process: the policy gate runs on every tool call
+    and there is no point re-resolving the same name within one engagement.
+    Failures are not cached, so a transient DNS error gets retried.
+    """
+    infos = socket.getaddrinfo(host, None)
+    return tuple(sorted({info[4][0] for info in infos}))
 
 
 def _extract_host(target: str) -> str:
@@ -99,6 +125,8 @@ class EngagementPolicy:
     denied_tools: set[str] = field(default_factory=set)
     scope: list[str] = field(default_factory=list)
     deny_private_targets: bool = False
+    resolve_targets: bool = False
+    resolver: Callable[[str], tuple[str, ...]] | None = None
     approver: Callable[[ApprovalRequest], bool] | None = None
 
     def _is_intrusive(self, tool: str) -> bool:
@@ -130,12 +158,18 @@ class EngagementPolicy:
         return False, f"target '{host}' is outside the declared scope"
 
     def _hits_denied_network(self, arguments: dict[str, Any]) -> tuple[bool, str]:
-        """Reject loopback and RFC1918 literals when private targets are banned.
+        """Reject loopback and RFC1918 targets when private targets are banned.
 
-        Only IP literals are range-checked, so a hostname that merely starts with
-        ``10.`` (e.g. ``10.example.com``) is not misclassified. This is still a
-        string-level check: it does not resolve DNS, so a public hostname that
-        resolves to a private address is not caught here.
+        IP literals are range-checked directly. Hostnames are only checked when
+        ``resolve_targets`` is on, in which case *every* address the name resolves
+        to has to be public. Resolution is injectable so tests never touch the
+        network, and it fails closed: an unresolvable name is denied rather than
+        waved through.
+
+        This cannot stop DNS rebinding. The tools resolve the name again when
+        they connect, so a name whose answer changes after this check still
+        reaches the private address. Pinning the checked IP for the connection
+        would be the real fix, and that requires controlling the tool's sockets.
         """
         if not self.deny_private_targets:
             return False, ""
@@ -148,13 +182,28 @@ class EngagementPolicy:
         if host == "localhost":
             return True, f"target '{host}' is a loopback address"
 
-        try:
-            ip = ip_address(host)
-        except ValueError:
-            return False, ""  # a hostname, not an IP literal
+        literal = _as_ip(host)
+        if literal is not None:
+            if _is_private_addr(literal):
+                return True, f"target '{host}' is a private/loopback address"
+            return False, ""
 
-        if any(ip in net for net in PRIVATE_NETWORKS):
-            return True, f"target '{host}' is a private/loopback address"
+        if not self.resolve_targets:
+            return False, ""
+
+        resolve = self.resolver or _default_resolve
+        try:
+            addresses = resolve(host)
+        except (OSError, ValueError) as exc:
+            return True, f"'{host}' could not be resolved to confirm it is public ({exc})"
+
+        if not addresses:
+            return True, f"'{host}' resolved to no addresses"
+
+        for addr in addresses:
+            ip = _as_ip(addr)
+            if ip is not None and _is_private_addr(ip):
+                return True, f"'{host}' resolves to the private address {addr}"
         return False, ""
 
     def evaluate(self, tool: str, arguments: dict[str, Any]) -> tuple[Decision, str]:
@@ -206,6 +255,7 @@ class EngagementPolicy:
             denied_tools=set(data.get("denied_tools", [])),
             scope=list(data.get("scope", [])),
             deny_private_targets=bool(data.get("deny_private_targets", False)),
+            resolve_targets=bool(data.get("resolve_targets", False)),
         )
 
     def render(self) -> str:
@@ -215,7 +265,8 @@ class EngagementPolicy:
         if self.denied_tools:
             lines.append(f"  denied: {', '.join(sorted(self.denied_tools))}")
         if self.deny_private_targets:
-            lines.append("  private/loopback targets: denied")
+            suffix = ", hostnames resolved" if self.resolve_targets else ""
+            lines.append(f"  private/loopback targets: denied{suffix}")
         return "\n".join(lines)
 
 

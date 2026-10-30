@@ -144,6 +144,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deny loopback/private-address targets (guards against SSRF-style mistakes)",
     )
     p.add_argument(
+        "--resolve-targets",
+        action="store_true",
+        help=(
+            "With --deny-private, also resolve hostnames and deny any that map to a "
+            "private address. Names that fail to resolve are denied too."
+        ),
+    )
+    p.add_argument(
         "--yes",
         action="store_true",
         help="Auto-approve intrusive actions (only for authorized engagements)",
@@ -237,6 +245,7 @@ async def cmd_assess(args) -> int:
         denied_tools=set(args.deny_tools),
         scope=list(args.scope),
         deny_private_targets=args.deny_private,
+        resolve_targets=args.resolve_targets,
         approver=(lambda _req: True) if args.yes else _interactive_approver,
     )
     store = None if args.no_store else (Store(args.db) if args.db else Store())
