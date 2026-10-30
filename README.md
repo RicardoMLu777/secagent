@@ -206,6 +206,9 @@ python secagent.py --target x --scope 'example\.com' --scope 'testsite\.org'
 # 禁止访问回环/内网地址（防 SSRF 式的误操作）
 python secagent.py --target x --deny-private
 
+# 连域名一起查：解析结果里只要有一个私网地址就拒绝
+python secagent.py --target x --deny-private --resolve-targets
+
 # 彻底禁用某个工具
 python secagent.py --target x --deny-tools sqlmap_dump ffuf_dirs
 ```
@@ -213,6 +216,10 @@ python secagent.py --target x --deny-tools sqlmap_dump ffuf_dirs
 `--scope` 按 **hostname 全匹配**，不是子串匹配：`example\.com` 不会放行 `example.com.attacker.net` 或 `evilexample.com`。要放行子域需显式写出 `--scope '.*\.example\.com'`。
 
 `--deny-private` 拦截 `127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`169.254.0.0/16` 与 `::1`。判断依据是 IP 字面量，因此 `10.example.com` 这类域名不会被误伤。这条规则在扫内网时要注意关掉。
+
+默认只校验字面量——一个指向 `192.168.x.x` 的域名照样能过。加上 `--resolve-targets` 才会解析：解析出的**任意一个**地址落在上述网段即拒绝，解析失败或没有结果也拒绝（fail closed）。结果按 hostname 缓存在进程内，不会每次工具调用都查一遍。
+
+这挡得住「域名静态指向内网」，挡不住 DNS rebinding：工具连接时会自己再解析一次，若那时答案变了，仍然会连到内网。真正的修法是让校验出的 IP 与实际连接绑定，那需要接管工具的 socket，当前没做——见[已知局限](#已知局限)。
 
 ### 3. 全链路审计
 
@@ -599,7 +606,7 @@ secagent/
 
 诚实记录边界，不做过度承诺。
 
-1. **不解析 DNS** —— `--deny-private` 只判断 IP 字面量。若某个域名解析到 `192.168.x.x`（DNS rebinding 一类手法），字符串层拦不住。正确做法是在建立连接前对解析结果再校验一次，当前未实现。
+1. **DNS 校验有 TOCTOU 窗口** —— `--deny-private --resolve-targets` 会解析域名并拒绝指向私网的答案，但校验与实际连接之间存在时间差：nmap / sqlmap 连接时会自己再解析一次，攻击者控制的域名（TTL 设 0、应答随请求变化）可以在两次解析之间换掉答案。彻底解决要把校验出的 IP 钉进连接，需要接管工具的 socket，当前未做。不加 `--resolve-targets` 时，指向内网的域名完全不设防。
 2. **工具输出解析依赖正则** —— `memory.py` 从原始输出中抽取端口、服务、路径等事实。工具版本升级改变输出格式时抽取可能失败，降级策略是保留原始观察、放弃结构化字段，不中断执行。
 3. **未对抗 prompt injection** —— 如果被扫描目标返回的 banner 或页面内容里嵌入了指令，模型的规划可能被污染。目前依赖 policy 层兜底（越界目标会被拒绝），但没有输入侧的隔离与净化。
 4. **单机单进程** —— 没有任务队列、没有并发目标隔离。定位是单次授权评估的辅助工具，不是扫描平台。
@@ -609,7 +616,8 @@ secagent/
 
 ## 后续计划
 
-- [ ] 解析后 IP 校验，堵住 DNS rebinding 路径
+- [x] 解析后 IP 校验（0.3.3，`--resolve-targets`）
+- [ ] 把校验出的 IP 钉进实际连接，关闭 DNS 校验与连接之间的 TOCTOU 窗口
 - [ ] 目标响应内容与指令上下文隔离，做 prompt injection 防护
 - [ ] 新增 `nuclei_server.py`（模板化漏洞检测）
 - [ ] 报告支持 SARIF 输出，便于接入 CI

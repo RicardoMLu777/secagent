@@ -7,7 +7,7 @@ from .memory import Memory, Observation
 from .planner import Plan, Planner, Task
 from . import report
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 __all__ = [
     "SecAgent",
     "MCPManager",

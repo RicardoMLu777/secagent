@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-30
+
+### Added
+
+- **`--resolve-targets`** — with `--deny-private`, hostnames are resolved and
+  denied when *any* answer falls in a private range. Resolution failures and
+  empty answers are denied as well (fail closed). Answers are cached per
+  process, so the gate does not re-query DNS on every tool call.
+- `EngagementPolicy.resolver` is injectable, which keeps the resolution path
+  testable without network access. `tests/test_policy_dns.py` covers public,
+  private, mixed, loopback, link-local, unresolvable and empty answers, plus the
+  guarantee that IP literals never trigger a lookup.
+
+### Changed
+
+- The first known limitation is now narrower and more honest. Resolution
+  checking exists, but a TOCTOU window remains: the tools resolve the name again
+  when they connect, so a TTL 0 record can change answer between the check and
+  the connection. Pinning the checked IP into the connection is tracked as
+  future work.
+
 ## [0.3.2] - 2026-10-30
 
 ### Security
@@ -83,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapping and Markdown reports.
 - Four MCP servers: nmap (2 tools), httpx (3), sqlmap (3), ffuf (1).
 
-[Unreleased]: https://github.com/RicardoMLu777/secagent/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/RicardoMLu777/secagent/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/RicardoMLu777/secagent/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/RicardoMLu777/secagent/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/RicardoMLu777/secagent/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/RicardoMLu777/secagent/compare/v0.2.0...v0.3.0
