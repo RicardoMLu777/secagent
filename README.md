@@ -8,6 +8,7 @@
 [![MCP](https://img.shields.io/badge/MCP-1.9.4-green.svg)](https://modelcontextprotocol.io/)
 [![tests](https://github.com/RicardoMLu777/secagent/actions/workflows/tests.yml/badge.svg)](https://github.com/RicardoMLu777/secagent/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![changelog](https://img.shields.io/badge/changelog-keep%20a%20changelog-e05735.svg)](CHANGELOG.md)
 
 > [!WARNING]
 > **仅限授权测试。** SecAgent 会执行真实的端口扫描、目录爆破与 SQL 注入检测。请只在自有资产、持有书面授权的目标或本地靶场中使用。未授权扫描在多数司法辖区属于违法行为。详见文末 [Disclaimer](#disclaimer)。
@@ -537,6 +538,7 @@ secagent/
 │   ├── retry.py          # 瞬时错误指数退避
 │   └── report.py         # Markdown / JSON 报告渲染
 ├── mcp_servers/
+│   ├── mcp_guard.py      # argv 形状校验（防参数注入）
 │   ├── nmap_server.py    # 端口扫描 / NSE
 │   ├── httpx_server.py   # HTTP 探测 / 安全头 / robots
 │   ├── sqlmap_server.py  # 注入检测 / 库表枚举 / 导出
@@ -547,6 +549,7 @@ secagent/
 ├── requirements.txt
 ├── .env.example
 ├── Dockerfile
+├── CHANGELOG.md
 ├── LICENSE
 └── README.md
 ```
@@ -557,7 +560,23 @@ secagent/
 
 记录本项目自己被审计出来的问题及修复方式。
 
-### `--scope` 白名单可被绕过（已修复）
+### `nmap` 工具存在参数注入（已修复 · 0.3.2）
+
+`nmap_scan` / `nmap_vuln_scan` 的 `target` 曾被直接追加到 argv 末尾。因为参数不经过 shell，直觉上会以为没风险——**但开头的 `-` 才是问题**：
+
+| 模型给出的 target | nmap 实际执行 |
+|---|---|
+| `-iL /etc/passwd` | 把该文件当扫描目标列表读进来 |
+| `-oN /tmp/out` | 把扫描结果写到任意路径 |
+| `--script=vuln` | 悄悄切换成漏洞脚本扫描 |
+
+也就是说，一个被污染的提示词足以让「扫一个主机」变成「读一个文件」。
+
+现在 target 必须匹配保守字符集、不能以 `-` 开头、不能含 `..`、长度上限 255；`ports` 同样限制为 `[0-9,-]`。规则集中在 `mcp_servers/mcp_guard.py`，回归测试见 `tests/test_mcp_guard.py`。
+
+> 教训：**参数不经过 shell 不等于安全。** shell 注入只是其中一个平面，argv 注入是另一个，而后者常被"我用了 list 形式"这句话掩盖掉。
+
+### `--scope` 白名单可被绕过（已修复 · 0.3.1）
 
 早期实现用 `re.search(pattern, target)` 对整个目标字符串做子串匹配，`--scope 'example\.com'` 会放行以下目标：
 
